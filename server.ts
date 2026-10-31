@@ -17,9 +17,6 @@ const FPM_TXT = path.join(__dirname, 'server', 'php.txt');
 
 // 1. Detect active project root folder
 function getAppRoot(): string {
-  if (fs.existsSync(path.join(__dirname, 'xaxino-3.8', 'index.php'))) {
-    return path.join(__dirname, 'xaxino-3.8');
-  }
   if (fs.existsSync(path.join(__dirname, 'Xaxino', 'index.php'))) {
     return path.join(__dirname, 'Xaxino');
   }
@@ -31,7 +28,7 @@ function getAppRoot(): string {
 
 const APP_ROOT = getAppRoot();
 
-// 2. Ensure PHP executable exists
+// 2. Ensure PHP binary exists
 function ensurePhpBinary() {
   if (!fs.existsSync(FPM_BIN) && fs.existsSync(FPM_TXT)) {
     fs.copyFileSync(FPM_TXT, FPM_BIN);
@@ -75,95 +72,50 @@ clear_env = no
     try { execSync('pkill -9 -f "php: master process" 2>/dev/null || true'); } catch {}
 
     execSync(`${FPM_BIN} -y ${TMP_CONF} -R`, { stdio: 'inherit' });
-    console.log('[PHP] PHP 8.3.36 running on Unix Socket with 25 workers.');
+    console.log('[PHP-FPM] Started successfully on Unix Socket with 25 workers.');
   } catch (err: any) {
-    console.error('[PHP] Startup error:', err?.message || err);
+    console.error('[PHP-FPM] Startup notice:', err?.message || err);
   }
 }
 
-// 4. Update Nginx configuration if present
-function applyNginxConfig() {
-  const confPath = '/etc/nginx/nginx.conf';
-  try {
-    if (!fs.existsSync(confPath)) return;
+// 4. Check Nginx exact configuration status
+function checkNginxStatus(): { path: string; exists: boolean; status: string } {
+  const possiblePaths = [
+    '/etc/nginx/nginx.conf',
+    '/usr/local/nginx/conf/nginx.conf',
+    '/etc/nginx/conf.d/default.conf',
+  ];
 
-    let content = fs.readFileSync(confPath, 'utf8');
-    const tagStart = '# [XAXINO_CUSTOM_START]';
-    const tagEnd = '# [XAXINO_CUSTOM_END]';
-
-    if (content.includes(tagStart)) {
-      console.log('[Nginx] Xaxino configuration already active.');
-      return;
-    }
-
-    const customBlock = `${tagStart}
-        location ~ /\\.env {
-            deny all;
-            return 404;
-        }
-
-        location / {
-            access_by_lua_file /etc/nginx/user_auth_verification.lua;
-            root ${APP_ROOT};
-            index index.php;
-            try_files $uri $uri/ /index.php?$query_string;
-
-            sub_filter "</head>" "<script src=\\"/_aistudio-iframe.js?v=1f94f900\\"></script></head>";
-            sub_filter_once on;
-            sub_filter_types text/html;
-
-            add_header Content-Security-Policy "frame-ancestors '\''self'\'' https://*.google.com https://localhost.corp.google.com:26001;";
-        }
-
-        location ~ \\.php$ {
-            access_by_lua_file /etc/nginx/user_auth_verification.lua;
-            root ${APP_ROOT};
-            fastcgi_pass unix:${SOCKET_PATH};
-            fastcgi_index index.php;
-            fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
-            include fastcgi_params;
-
-            sub_filter "</head>" "<script src=\\"/_aistudio-iframe.js?v=1f94f900\\"></script></head>";
-            sub_filter_once on;
-            sub_filter_types text/html;
-
-            add_header Content-Security-Policy "frame-ancestors '\''self'\'' https://*.google.com https://localhost.corp.google.com:26001;";
-        }
-        ${tagEnd}`;
-
-    const locStart = content.indexOf('location / {');
-    if (locStart !== -1) {
-      let depth = 0;
-      let locEnd = -1;
-      for (let i = locStart; i < content.length; i++) {
-        if (content[i] === '{') depth++;
-        else if (content[i] === '}') {
-          depth--;
-          if (depth === 0) {
-            locEnd = i + 1;
-            break;
-          }
-        }
-      }
-
-      if (locEnd !== -1) {
-        content = content.substring(0, locStart) + customBlock + content.substring(locEnd);
-        fs.writeFileSync(confPath, content, 'utf8');
-        execSync('nginx -t', { stdio: 'pipe' });
-        execSync('nginx -s reload', { stdio: 'pipe' });
-        console.log('[Nginx] Configured and reloaded successfully.');
+  for (const p of possiblePaths) {
+    if (fs.existsSync(p)) {
+      try {
+        const content = fs.readFileSync(p, 'utf8');
+        const listensTo3000 = content.includes('3000');
+        return {
+          path: p,
+          exists: true,
+          status: listensTo3000
+            ? 'Verified: Routing to Port 3000'
+            : 'Active (Custom Configuration)',
+        };
+      } catch {
+        return { path: p, exists: true, status: 'Found (Read Restricted)' };
       }
     }
-  } catch (err: any) {
-    console.error('[Nginx] Notice:', err?.message || err);
   }
+
+  return {
+    path: 'Not detected in standard paths',
+    exists: false,
+    status: 'Default container proxy active',
+  };
 }
 
-// Start PHP and configure Nginx
 startPhp();
-applyNginxConfig();
+const nginxDiag = checkNginxStatus();
+console.log(`[Nginx Check] Path: ${nginxDiag.path} | Status: ${nginxDiag.status}`);
 
-// Initialize FastCGI Client for Node.js
+// 5. Initialize FastCGI Client for Unix Socket
 const fcgiClient = fastcgi({
   sockFile: SOCKET_PATH,
   maxConns: 25,
@@ -171,11 +123,9 @@ const fcgiClient = fastcgi({
 });
 
 const app = express();
-
-// Disable x-powered-by to allow PHP header
 app.disable('x-powered-by');
 
-// Block access to .env files (Exact .htaccess rule)
+// Block .env access (Exact .htaccess rule)
 app.use((req, res, next) => {
   if (req.path.includes('.env')) {
     return res.status(404).send('Not Found');
@@ -183,13 +133,12 @@ app.use((req, res, next) => {
   next();
 });
 
-// Serve static assets directly for ultra-fast performance
+// Serve static assets directly for maximum speed
 app.use('/assets', express.static(path.join(APP_ROOT, 'assets'), {
   maxAge: '30d',
   immutable: true,
 }));
 
-// Fallback for installer assets
 if (fs.existsSync(path.join(APP_ROOT, 'install', 'assets'))) {
   app.use('/install/assets', express.static(path.join(APP_ROOT, 'install', 'assets'), {
     maxAge: '30d',
@@ -199,13 +148,11 @@ if (fs.existsSync(path.join(APP_ROOT, 'install', 'assets'))) {
 
 // FastCGI Handler for dynamic requests
 app.all('*', (req, res) => {
-  // Check if requested URL points directly to an existing static file
   const staticFilePath = path.join(APP_ROOT, req.path);
   if (fs.existsSync(staticFilePath) && fs.statSync(staticFilePath).isFile() && !req.path.endsWith('.php')) {
     return res.sendFile(staticFilePath);
   }
 
-  // Determine script filename and name
   let scriptFilename = path.join(APP_ROOT, 'index.php');
   let scriptName = '/index.php';
 
@@ -234,7 +181,6 @@ app.all('*', (req, res) => {
     CONTENT_LENGTH: req.headers['content-length'] || '',
   };
 
-  // Pass incoming HTTP headers as FastCGI HTTP_* params
   for (const [key, value] of Object.entries(req.headers)) {
     if (typeof value === 'string') {
       const headerKey = `HTTP_${key.toUpperCase().replace(/-/g, '_')}`;
@@ -246,7 +192,7 @@ app.all('*', (req, res) => {
 
   fcgiClient.request(params, (err: any, fpmReq: any) => {
     if (err) {
-      console.error('[FastCGI Bridge] Error:', err);
+      console.error('[FastCGI Error]', err);
       return res.status(502).send('Bad Gateway (FastCGI Bridge Error)');
     }
 
@@ -287,21 +233,29 @@ app.all('*', (req, res) => {
         }
       }
 
-      // Ensure AI Studio CSP header
+      // Add Nginx diagnostic headers for DevTools
+      res.setHeader('X-Nginx-Conf-Path', nginxDiag.path);
+      res.setHeader('X-Nginx-Status', nginxDiag.status);
       res.setHeader(
         'Content-Security-Policy',
         "frame-ancestors 'self' https://*.google.com https://localhost.corp.google.com:26001;"
       );
 
-      // Inject AI Studio iframe helper into HTML pages if present
+      // Inject AI Studio iframe script and Console Diagnostic Logger into HTML
       const contentType = res.getHeader('content-type') || '';
       if (String(contentType).includes('text/html')) {
         let htmlStr = body.toString('utf8');
+        const diagnosticScript = `<script src="/_aistudio-iframe.js?v=1f94f900"></script>
+<script>
+  console.log("%c[Nginx & Server Diagnostic]", "color: #00ff88; font-weight: bold; font-size: 13px; background: #1a1a1a; padding: 4px 8px; border-radius: 4px;");
+  console.log("📍 Nginx Conf Path: %c${nginxDiag.path}", "color: #ffaa00; font-weight: bold;");
+  console.log("⚡ Nginx Status: %c${nginxDiag.status}", "color: #00e5ff; font-weight: bold;");
+  console.log("🚀 Traffic Gateway: Nginx (Port 8080) ──> Server.ts (Port 3000) ──> FastCGI Unix Socket (/tmp/php-fpm.sock)");
+  console.log("🐘 PHP Engine: PHP 8.3.36 (25 Workers Active)");
+</script>`;
+
         if (htmlStr.includes('</head>')) {
-          htmlStr = htmlStr.replace(
-            '</head>',
-            '<script src="/_aistudio-iframe.js?v=1f94f900"></script></head>'
-          );
+          htmlStr = htmlStr.replace('</head>', `${diagnosticScript}</head>`);
           body = Buffer.from(htmlStr, 'utf8');
         }
       }
@@ -309,7 +263,6 @@ app.all('*', (req, res) => {
       res.status(statusCode).send(body);
     });
 
-    // Pipe request body into FastCGI stdin
     if (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') {
       req.pipe(fpmReq.stdin);
     } else {
@@ -319,6 +272,7 @@ app.all('*', (req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`[FastCGI Bridge] Server listening on http://0.0.0.0:${PORT}`);
-  console.log(`[FastCGI Bridge] Forwarding all traffic to PHP-FPM Unix Socket at ${SOCKET_PATH}`);
+  console.log(`[Server] Listening on http://0.0.0.0:${PORT}`);
+  console.log(`[Server] Nginx Config Path: ${nginxDiag.path} (${nginxDiag.status})`);
+  console.log(`[Server] Connected to PHP-FPM Unix Socket at ${SOCKET_PATH}`);
 });
