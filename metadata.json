@@ -1,8 +1,0 @@
-{
-  "name": "Xaxino",
-  "description": "Xaxino is the ultimate casino platform",
-  "requestFramePermissions": [],
-  "majorCapabilities": [
-    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
-  ]
-}
